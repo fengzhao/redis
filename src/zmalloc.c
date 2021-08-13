@@ -28,11 +28,19 @@
  * POSSIBILITY OF SUCH DAMAGE.
  */
 
+#include "fmacros.h"
+#include "config.h"
+#include "solarisfixes.h"
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdint.h>
 #include <unistd.h>
 #include <assert.h>
+
+#ifdef __linux__
+#include <sys/mman.h>
+#endif
 
 /* This function provide us access to the original libc free(). This is useful
  * for instance to free results obtained by backtrace_symbols(). We need
@@ -44,7 +52,6 @@ void zlibc_free(void *ptr) {
 
 #include <string.h>
 #include <pthread.h>
-#include "config.h"
 #include "zmalloc.h"
 #include "atomicvar.h"
 
@@ -335,6 +342,31 @@ void zmalloc_set_oom_handler(void (*oom_handler)(size_t)) {
     zmalloc_oom_handler = oom_handler;
 }
 
+/* Use 'MADV_DONTNEED' to release memory to operating system quickly.
+ * We do that in a fork child process to avoid CoW when the parent modifies
+ * these shared pages. */
+void zmadvise_dontneed(void *ptr) {
+#if defined(USE_JEMALLOC) && defined(__linux__)
+    static size_t page_size = 0;
+    if (page_size == 0) page_size = sysconf(_SC_PAGESIZE);
+    size_t page_size_mask = page_size - 1;
+
+    size_t real_size = zmalloc_size(ptr);
+    if (real_size < page_size) return;
+
+    /* We need to align the pointer upwards according to page size, because
+     * the memory address is increased upwards and we only can free memory
+     * based on page. */
+    char *aligned_ptr = (char *)(((size_t)ptr+page_size_mask) & ~page_size_mask);
+    real_size -= (aligned_ptr-(char*)ptr);
+    if (real_size >= page_size) {
+        madvise((void *)aligned_ptr, real_size&~page_size_mask, MADV_DONTNEED);
+    }
+#else
+    (void)(ptr);
+#endif
+}
+
 /* Get the RSS information in an OS-specific way.
  *
  * WARNING: the function zmalloc_get_rss() is not designed to be fast
@@ -613,6 +645,11 @@ size_t zmalloc_get_smap_bytes_by_field(char *field, long pid) {
 }
 #endif
 
+/* Return the total number bytes in pages marked as Private Dirty.
+ *
+ * Note: depending on the platform and memory footprint of the process, this
+ * call can be slow, exceeding 1000ms!
+ */
 size_t zmalloc_get_private_dirty(long pid) {
     return zmalloc_get_smap_bytes_by_field("Private_Dirty:",pid);
 }
