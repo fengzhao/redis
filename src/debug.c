@@ -162,7 +162,7 @@ void xorObjectDigest(redisDb *db, robj *keyobj, unsigned char *digest, robj *o) 
     } else if (o->type == OBJ_ZSET) {
         unsigned char eledigest[20];
 
-        if (o->encoding == OBJ_ENCODING_ZIPLIST) {
+        if (o->encoding == OBJ_ENCODING_LISTPACK) {
             unsigned char *zl = o->ptr;
             unsigned char *eptr, *sptr;
             unsigned char *vstr;
@@ -170,13 +170,13 @@ void xorObjectDigest(redisDb *db, robj *keyobj, unsigned char *digest, robj *o) 
             long long vll;
             double score;
 
-            eptr = ziplistIndex(zl,0);
+            eptr = lpSeek(zl,0);
             serverAssert(eptr != NULL);
-            sptr = ziplistNext(zl,eptr);
+            sptr = lpNext(zl,eptr);
             serverAssert(sptr != NULL);
 
             while (eptr != NULL) {
-                serverAssert(ziplistGet(eptr,&vstr,&vlen,&vll));
+                vstr = lpGetValue(eptr,&vlen,&vll);
                 score = zzlGetScore(sptr);
 
                 memset(eledigest,0,20);
@@ -469,6 +469,10 @@ void debugCommand(client *c) {
 "    Return the size of different Redis core C structures.",
 "ZIPLIST <key>",
 "    Show low level info about the ziplist encoding of <key>.",
+"CLIENT-EVICTION",
+"    Show low level client eviction pools info (maxmemory-clients).",
+"PAUSE-CRON <0|1>",
+"    Stop periodic cron job processing.",
 NULL
         };
         addReplyHelp(c, help);
@@ -883,6 +887,23 @@ NULL
             addReplyError(c, "CONFIG-REWRITE-FORCE-ALL failed");
         else
             addReply(c, shared.ok);
+    } else if(!strcasecmp(c->argv[1]->ptr,"client-eviction") && c->argc == 2) {
+        sds bucket_info = sdsempty();
+        for (int j = 0; j < CLIENT_MEM_USAGE_BUCKETS; j++) {
+            if (j == 0)
+                bucket_info = sdscatprintf(bucket_info, "bucket          0");
+            else
+                bucket_info = sdscatprintf(bucket_info, "bucket %10zu", (size_t)1<<(j-1+CLIENT_MEM_USAGE_BUCKET_MIN_LOG));
+            if (j == CLIENT_MEM_USAGE_BUCKETS-1)
+                bucket_info = sdscatprintf(bucket_info, "+            : ");
+            else
+                bucket_info = sdscatprintf(bucket_info, " - %10zu: ", ((size_t)1<<(j+CLIENT_MEM_USAGE_BUCKET_MIN_LOG))-1);
+            bucket_info = sdscatprintf(bucket_info, "tot-mem: %10zu, clients: %lu\n",
+                server.client_mem_usage_buckets[j].mem_usage_sum,
+                server.client_mem_usage_buckets[j].clients->len);
+        }
+        addReplyVerbatim(c,bucket_info,sdslen(bucket_info),"txt");
+        sdsfree(bucket_info);
 #ifdef USE_JEMALLOC
     } else if(!strcasecmp(c->argv[1]->ptr,"mallctl") && c->argc >= 3) {
         mallctl_int(c, c->argv+2, c->argc-2);
@@ -891,6 +912,10 @@ NULL
         mallctl_string(c, c->argv+2, c->argc-2);
         return;
 #endif
+    } else if (!strcasecmp(c->argv[1]->ptr,"pause-cron") && c->argc == 3)
+    {
+        server.pause_cron = atoi(c->argv[2]->ptr);
+        addReply(c,shared.ok);
     } else {
         addReplySubcommandSyntaxError(c);
         return;
@@ -1024,6 +1049,10 @@ void bugReportStart(void) {
 
 #ifdef HAVE_BACKTRACE
 static void *getMcontextEip(ucontext_t *uc) {
+#define NOT_SUPPORTED() do {\
+    UNUSED(uc);\
+    return NULL;\
+} while(0)
 #if defined(__APPLE__) && !defined(MAC_OS_X_VERSION_10_6)
     /* OSX < 10.6 */
     #if defined(__x86_64__)
@@ -1055,6 +1084,8 @@ static void *getMcontextEip(ucontext_t *uc) {
     return (void*) uc->uc_mcontext.arm_pc;
     #elif defined(__aarch64__) /* Linux AArch64 */
     return (void*) uc->uc_mcontext.pc;
+    #else
+    NOT_SUPPORTED();
     #endif
 #elif defined(__FreeBSD__)
     /* FreeBSD */
@@ -1062,6 +1093,8 @@ static void *getMcontextEip(ucontext_t *uc) {
     return (void*) uc->uc_mcontext.mc_eip;
     #elif defined(__x86_64__)
     return (void*) uc->uc_mcontext.mc_rip;
+    #else
+    NOT_SUPPORTED();
     #endif
 #elif defined(__OpenBSD__)
     /* OpenBSD */
@@ -1069,18 +1102,23 @@ static void *getMcontextEip(ucontext_t *uc) {
     return (void*) uc->sc_eip;
     #elif defined(__x86_64__)
     return (void*) uc->sc_rip;
+    #else
+    NOT_SUPPORTED();
     #endif
 #elif defined(__NetBSD__)
     #if defined(__i386__)
     return (void*) uc->uc_mcontext.__gregs[_REG_EIP];
     #elif defined(__x86_64__)
     return (void*) uc->uc_mcontext.__gregs[_REG_RIP];
+    #else
+    NOT_SUPPORTED();
     #endif
 #elif defined(__DragonFly__)
     return (void*) uc->uc_mcontext.mc_rip;
 #else
-    return NULL;
+    NOT_SUPPORTED();
 #endif
+#undef NOT_SUPPORTED
 }
 
 void logStackContent(void **sp) {
@@ -1099,6 +1137,11 @@ void logStackContent(void **sp) {
 /* Log dump of processor registers */
 void logRegisters(ucontext_t *uc) {
     serverLog(LL_WARNING|LL_RAW, "\n------ REGISTERS ------\n");
+#define NOT_SUPPORTED() do {\
+    UNUSED(uc);\
+    serverLog(LL_WARNING,\
+              "  Dumping of registers not supported for this OS/arch");\
+} while(0)
 
 /* OSX */
 #if defined(__APPLE__) && defined(MAC_OS_X_VERSION_10_6)
@@ -1323,6 +1366,8 @@ void logRegisters(ucontext_t *uc) {
 	      (unsigned long) uc->uc_mcontext.fault_address
 		      );
 	      logStackContent((void**)uc->uc_mcontext.arm_sp);
+    #else
+	NOT_SUPPORTED();
     #endif
 #elif defined(__FreeBSD__)
     #if defined(__x86_64__)
@@ -1378,6 +1423,8 @@ void logRegisters(ucontext_t *uc) {
         (unsigned long) uc->uc_mcontext.mc_gs
     );
     logStackContent((void**)uc->uc_mcontext.mc_esp);
+    #else
+    NOT_SUPPORTED();
     #endif
 #elif defined(__OpenBSD__)
     #if defined(__x86_64__)
@@ -1433,6 +1480,8 @@ void logRegisters(ucontext_t *uc) {
         (unsigned long) uc->sc_gs
     );
     logStackContent((void**)uc->sc_esp);
+    #else
+    NOT_SUPPORTED();
     #endif
 #elif defined(__NetBSD__)
     #if defined(__x86_64__)
@@ -1486,6 +1535,8 @@ void logRegisters(ucontext_t *uc) {
         (unsigned long) uc->uc_mcontext.__gregs[_REG_FS],
         (unsigned long) uc->uc_mcontext.__gregs[_REG_GS]
     );
+    #else
+    NOT_SUPPORTED();
     #endif
 #elif defined(__DragonFly__)
     serverLog(LL_WARNING,
@@ -1517,9 +1568,9 @@ void logRegisters(ucontext_t *uc) {
     );
     logStackContent((void**)uc->uc_mcontext.mc_rsp);
 #else
-    serverLog(LL_WARNING,
-        "  Dumping of registers not supported for this OS/arch");
+    NOT_SUPPORTED();
 #endif
+#undef NOT_SUPPORTED
 }
 
 #endif /* HAVE_BACKTRACE */

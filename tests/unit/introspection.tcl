@@ -149,6 +149,7 @@ start_server {tags {"introspection"}} {
             io-threads
             logfile
             unixsocketperm
+            replicaof
             slaveof
             requirepass
             server_cpulist
@@ -156,6 +157,7 @@ start_server {tags {"introspection"}} {
             aof_rewrite_cpulist
             bgsave_cpulist
             set-proc-title
+            cluster-config-file
         }
 
         if {!$::tls} {

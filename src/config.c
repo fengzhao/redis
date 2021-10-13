@@ -198,6 +198,10 @@ typedef enum numericType {
     NUMERIC_TYPE_TIME_T,
 } numericType;
 
+#define INTEGER_CONFIG 0 /* No flags means a simple integer configuration */
+#define MEMORY_CONFIG (1<<0) /* Indicates if this value can be loaded as a memory value */
+#define PERCENT_CONFIG (1<<1) /* Indicates if this value can be loaded as a percent (and stored as a negative int) */
+
 typedef struct numericConfigData {
     union {
         int *i;
@@ -211,7 +215,7 @@ typedef struct numericConfigData {
         off_t *ot;
         time_t *tt;
     } config; /* The pointer to the numeric config this value is stored in */
-    int is_memory; /* Indicates if this value can be loaded as a memory value */
+    unsigned int flags;
     numericType numeric_type; /* An enum indicating the type of this value */
     long long lower_bound; /* The lower bound of this numeric value */
     long long upper_bound; /* The upper bound of this numeric value */
@@ -384,6 +388,62 @@ static int updateOOMScoreAdjValues(sds *args, const char **err, int apply) {
     return C_OK;
 }
 
+/* Parse an array of `arg_len` sds strings, validate and populate
+ * server.client_obuf_limits if valid.
+ * Used in CONFIG SET and configuration file parsing. */
+static int updateClientOutputBufferLimit(sds *args, int arg_len, const char **err) {
+    int j;
+    int class;
+    unsigned long long hard, soft;
+    int hard_err, soft_err;
+    int soft_seconds;
+    char *soft_seconds_eptr;
+    clientBufferLimitsConfig values[CLIENT_TYPE_OBUF_COUNT];
+    int classes[CLIENT_TYPE_OBUF_COUNT] = {0};
+
+    /* We need a multiple of 4: <class> <hard> <soft> <soft_seconds> */
+    if (arg_len % 4) {
+        if (err) *err = "Wrong number of arguments in "
+                        "buffer limit configuration.";
+        return C_ERR;
+    }
+
+    /* Sanity check of single arguments, so that we either refuse the
+     * whole configuration string or accept it all, even if a single
+     * error in a single client class is present. */
+    for (j = 0; j < arg_len; j += 4) {
+        class = getClientTypeByName(args[j]);
+        if (class == -1 || class == CLIENT_TYPE_MASTER) {
+            if (err) *err = "Invalid client class specified in "
+                            "buffer limit configuration.";
+            return C_ERR;
+        }
+
+        hard = memtoull(args[j+1], &hard_err);
+        soft = memtoull(args[j+2], &soft_err);
+        soft_seconds = strtoll(args[j+3], &soft_seconds_eptr, 10);
+        if (hard_err || soft_err ||
+            soft_seconds < 0 || *soft_seconds_eptr != '\0')
+        {
+            if (err) *err = "Error in hard, soft or soft_seconds setting in "
+                            "buffer limit configuration.";
+            return C_ERR;
+        }
+
+        values[class].hard_limit_bytes = hard;
+        values[class].soft_limit_bytes = soft;
+        values[class].soft_limit_seconds = soft_seconds;
+        classes[class] = 1;
+    }
+
+    /* Finally set the new config. */
+    for (j = 0; j < CLIENT_TYPE_OBUF_COUNT; j++) {
+        if (classes[j]) server.client_obuf_limits[j] = values[j];
+    }
+
+    return C_OK;
+}
+
 void initConfigValues() {
     for (standardConfig *config = configs; config->name != NULL; config++) {
         config->interface.init(config->data);
@@ -496,9 +556,6 @@ void loadServerConfigFromString(char *config) {
                                    argv[1], strerror(errno));
                 goto loaderr;
             }
-        } else if (!strcasecmp(argv[0],"logfile") && argc == 2) {
-            zfree(server.logfile);
-            server.logfile = zstrdup(argv[1]);
         } else if (!strcasecmp(argv[0],"include") && argc == 2) {
             loadServerConfig(argv[1], 0, NULL);
         } else if ((!strcasecmp(argv[0],"slaveof") ||
@@ -544,31 +601,10 @@ void loadServerConfigFromString(char *config) {
                     err = "Target command name already exists"; goto loaderr;
                 }
             }
-        } else if (!strcasecmp(argv[0],"cluster-config-file") && argc == 2) {
-            zfree(server.cluster_configfile);
-            server.cluster_configfile = zstrdup(argv[1]);
         } else if (!strcasecmp(argv[0],"client-output-buffer-limit") &&
                    argc == 5)
         {
-            int class = getClientTypeByName(argv[1]);
-            unsigned long long hard, soft;
-            int soft_seconds;
-
-            if (class == -1 || class == CLIENT_TYPE_MASTER) {
-                err = "Unrecognized client limit class: the user specified "
-                "an invalid one, or 'master' which has no buffer limits.";
-                goto loaderr;
-            }
-            hard = memtoll(argv[2],NULL);
-            soft = memtoll(argv[3],NULL);
-            soft_seconds = atoi(argv[4]);
-            if (soft_seconds < 0) {
-                err = "Negative number of seconds in soft limit is invalid";
-                goto loaderr;
-            }
-            server.client_obuf_limits[class].hard_limit_bytes = hard;
-            server.client_obuf_limits[class].soft_limit_bytes = soft;
-            server.client_obuf_limits[class].soft_limit_seconds = soft_seconds;
+            if (updateClientOutputBufferLimit(&argv[1], 4, &err) == C_ERR) goto loaderr;
         } else if (!strcasecmp(argv[0],"oom-score-adj-values") && argc == 1 + CONFIG_OOM_COUNT) {
             if (updateOOMScoreAdjValues(&argv[1], &err, 0) == C_ERR) goto loaderr;
         } else if (!strcasecmp(argv[0],"notify-keyspace-events") && argc == 2) {
@@ -744,8 +780,8 @@ void loadServerConfig(char *filename, char config_from_stdin, char *options) {
 
 #define config_set_memory_field(_name,_var) \
     } else if (!strcasecmp(c->argv[2]->ptr,_name)) { \
-        ll = memtoll(o->ptr,&err); \
-        if (err || ll < 0) goto badfmt; \
+        ll = memtoull(o->ptr,&err); \
+        if (err) goto badfmt; \
         _var = ll;
 
 #define config_set_special_field(_name) \
@@ -760,7 +796,6 @@ void loadServerConfig(char *filename, char config_from_stdin, char *options) {
 void configSetCommand(client *c) {
     robj *o;
     long long ll;
-    int err;
     const char *errstr = NULL;
     serverAssertWithInfo(c,c->argv[2],sdsEncodedObject(c->argv[2]));
     serverAssertWithInfo(c,c->argv[3],sdsEncodedObject(c->argv[3]));
@@ -842,50 +877,14 @@ void configSetCommand(client *c) {
             return;
         }
     } config_set_special_field("client-output-buffer-limit") {
-        int vlen, j;
+        int vlen;
         sds *v = sdssplitlen(o->ptr,sdslen(o->ptr)," ",1,&vlen);
 
-        /* We need a multiple of 4: <class> <hard> <soft> <soft_seconds> */
-        if (vlen % 4) {
-            sdsfreesplitres(v,vlen);
+        if (updateClientOutputBufferLimit(v, vlen, &errstr) == C_ERR) {
+            sdsfreesplitres(v, vlen);
             goto badfmt;
         }
 
-        /* Sanity check of single arguments, so that we either refuse the
-         * whole configuration string or accept it all, even if a single
-         * error in a single client class is present. */
-        for (j = 0; j < vlen; j++) {
-            long val;
-
-            if ((j % 4) == 0) {
-                int class = getClientTypeByName(v[j]);
-                if (class == -1 || class == CLIENT_TYPE_MASTER) {
-                    sdsfreesplitres(v,vlen);
-                    goto badfmt;
-                }
-            } else {
-                val = memtoll(v[j], &err);
-                if (err || val < 0) {
-                    sdsfreesplitres(v,vlen);
-                    goto badfmt;
-                }
-            }
-        }
-        /* Finally set the new config */
-        for (j = 0; j < vlen; j += 4) {
-            int class;
-            unsigned long long hard, soft;
-            int soft_seconds;
-
-            class = getClientTypeByName(v[j]);
-            hard = memtoll(v[j+1],NULL);
-            soft = memtoll(v[j+2],NULL);
-            soft_seconds = strtoll(v[j+3],NULL,10);
-
-            server.client_obuf_limits[class].hard_limit_bytes = hard;
-            server.client_obuf_limits[class].soft_limit_bytes = soft;
-            server.client_obuf_limits[class].soft_limit_seconds = soft_seconds;
-        }
         sdsfreesplitres(v,vlen);
     } config_set_special_field("oom-score-adj-values") {
         int vlen;
@@ -986,9 +985,6 @@ void configGetCommand(client *c) {
         }
     }
 
-    /* String values */
-    config_get_string_field("logfile",server.logfile);
-
     /* Numerical values */
     config_get_numerical_field("watchdog-period",server.watchdog_period);
 
@@ -1045,13 +1041,10 @@ void configGetCommand(client *c) {
         addReplyBulkCString(c,buf);
         matches++;
     }
-    if (stringmatch(pattern,"slaveof",1) ||
-        stringmatch(pattern,"replicaof",1))
-    {
-        char *optname = stringmatch(pattern,"slaveof",1) ?
-                        "slaveof" : "replicaof";
+    for (int i = 0; i < 2; i++) {
+        char *optname = i == 0 ? "replicaof" : "slaveof";
+        if (!stringmatch(pattern, optname, 1)) continue;
         char buf[256];
-
         addReplyBulkCString(c,optname);
         if (server.masterhost)
             snprintf(buf,sizeof(buf),"%s %d",
@@ -1346,6 +1339,14 @@ void rewriteConfigBytesOption(struct rewriteConfigState *state, const char *opti
 
     rewriteConfigFormatMemory(buf,sizeof(buf),value);
     line = sdscatprintf(sdsempty(),"%s %s",option,buf);
+    rewriteConfigRewriteLine(state,option,line,force);
+}
+
+/* Rewrite a simple "option-name n%" configuration option. */
+void rewriteConfigPercentOption(struct rewriteConfigState *state, const char *option, long long value, long long defvalue) {
+    int force = value != defvalue;
+    sds line = sdscatprintf(sdsempty(),"%s %lld%%",option,value);
+
     rewriteConfigRewriteLine(state,option,line,force);
 }
 
@@ -1799,12 +1800,10 @@ int rewriteConfig(char *path, int force_write) {
 
     rewriteConfigBindOption(state);
     rewriteConfigOctalOption(state,"unixsocketperm",server.unixsocketperm,CONFIG_DEFAULT_UNIX_SOCKET_PERM);
-    rewriteConfigStringOption(state,"logfile",server.logfile,CONFIG_DEFAULT_LOGFILE);
     rewriteConfigSaveOption(state);
     rewriteConfigUserOption(state);
     rewriteConfigDirOption(state);
     rewriteConfigSlaveofOption(state,"replicaof");
-    rewriteConfigStringOption(state,"cluster-config-file",server.cluster_configfile,CONFIG_DEFAULT_CLUSTER_CONFIG_FILE);
     rewriteConfigNotifykeyspaceeventsOption(state);
     rewriteConfigClientoutputbufferlimitOption(state);
     rewriteConfigOOMScoreAdjValuesOption(state);
@@ -2113,8 +2112,18 @@ static int numericBoundaryCheck(typeData data, long long ll, const char **err) {
             return 0;
         }
     } else {
+        /* Boundary check for percentages */
+        if (data.numeric.flags & PERCENT_CONFIG && ll < 0) {
+            if (ll < data.numeric.lower_bound) {
+                snprintf(loadbuf, LOADBUF_SIZE,
+                         "percentage argument must be less or equal to %lld",
+                         -data.numeric.lower_bound);
+                *err = loadbuf;
+                return 0;
+            }
+        }
         /* Boundary check for signed types */
-        if (ll > data.numeric.upper_bound || ll < data.numeric.lower_bound) {
+        else if (ll > data.numeric.upper_bound || ll < data.numeric.lower_bound) {
             snprintf(loadbuf, LOADBUF_SIZE,
                 "argument must be between %lld and %lld inclusive",
                 data.numeric.lower_bound,
@@ -2126,21 +2135,45 @@ static int numericBoundaryCheck(typeData data, long long ll, const char **err) {
     return 1;
 }
 
+static int numericParseString(typeData data, sds value, const char **err, long long *res) {
+    /* First try to parse as memory */
+    if (data.numeric.flags & MEMORY_CONFIG) {
+        int memerr;
+        *res = memtoull(value, &memerr);
+        if (!memerr)
+            return 1;
+    }
+
+    /* Attempt to parse as percent */
+    if (data.numeric.flags & PERCENT_CONFIG &&
+        sdslen(value) > 1 && value[sdslen(value)-1] == '%' &&
+        string2ll(value, sdslen(value)-1, res) &&
+        *res >= 0) {
+            /* We store percentage as negative value */
+            *res = -*res;
+            return 1;
+    }
+
+    /* Attempt a simple number (no special flags set) */
+    if (!data.numeric.flags && string2ll(value, sdslen(value), res))
+        return 1;
+
+    /* Select appropriate error string */
+    if (data.numeric.flags & MEMORY_CONFIG &&
+        data.numeric.flags & PERCENT_CONFIG)
+        *err = "argument must be a memory or percent value" ;
+    else if (data.numeric.flags & MEMORY_CONFIG)
+        *err = "argument must be a memory value";
+    else
+        *err = "argument couldn't be parsed into an integer";
+    return 0;
+}
+
 static int numericConfigSet(typeData data, sds value, int update, const char **err) {
     long long ll, prev = 0;
-    if (data.numeric.is_memory) {
-        int memerr;
-        ll = memtoll(value, &memerr);
-        if (memerr || ll < 0) {
-            *err = "argument must be a memory value";
-            return 0;
-        }
-    } else {
-        if (!string2ll(value, sdslen(value),&ll)) {
-            *err = "argument couldn't be parsed into an integer" ;
-            return 0;
-        }
-    }
+
+    if (!numericParseString(data, value, err, &ll))
+        return 0;
 
     if (!numericBoundaryCheck(data, ll, err))
         return 0;
@@ -2160,11 +2193,20 @@ static int numericConfigSet(typeData data, sds value, int update, const char **e
 
 static void numericConfigGet(client *c, typeData data) {
     char buf[128];
-    long long value = 0;
 
+    long long value = 0;
     GET_NUMERIC_TYPE(value)
 
-    ll2string(buf, sizeof(buf), value);
+    if (data.numeric.flags & PERCENT_CONFIG && value < 0) {
+        int len = ll2string(buf, sizeof(buf), -value);
+        buf[len] = '%';
+        buf[len+1] = '\0';
+    }
+    else if (data.numeric.flags & MEMORY_CONFIG) {
+        ull2string(buf, sizeof(buf), value);
+    } else {
+        ll2string(buf, sizeof(buf), value);
+    }
     addReplyBulkCString(c, buf);
 }
 
@@ -2173,18 +2215,17 @@ static void numericConfigRewrite(typeData data, const char *name, struct rewrite
 
     GET_NUMERIC_TYPE(value)
 
-    if (data.numeric.is_memory) {
+    if (data.numeric.flags & PERCENT_CONFIG && value < 0) {
+        rewriteConfigPercentOption(state, name, -value, data.numeric.default_value);
+    } else if (data.numeric.flags & MEMORY_CONFIG) {
         rewriteConfigBytesOption(state, name, value, data.numeric.default_value);
     } else {
         rewriteConfigNumericalOption(state, name, value, data.numeric.default_value);
     }
 }
 
-#define INTEGER_CONFIG 0
-#define MEMORY_CONFIG 1
-
-#define embedCommonNumericalConfig(name, alias, flags, lower, upper, config_addr, default, memory, is_valid, update) { \
-    embedCommonConfig(name, alias, flags) \
+#define embedCommonNumericalConfig(name, alias, _flags, lower, upper, config_addr, default, num_conf_flags, is_valid, update) { \
+    embedCommonConfig(name, alias, _flags) \
     embedConfigInterface(numericConfigInit, numericConfigSet, numericConfigGet, numericConfigRewrite) \
     .data.numeric = { \
         .lower_bound = (lower), \
@@ -2192,73 +2233,73 @@ static void numericConfigRewrite(typeData data, const char *name, struct rewrite
         .default_value = (default), \
         .is_valid_fn = (is_valid), \
         .update_fn = (update), \
-        .is_memory = (memory),
+        .flags = (num_conf_flags),
 
-#define createIntConfig(name, alias, flags, lower, upper, config_addr, default, memory, is_valid, update) \
-    embedCommonNumericalConfig(name, alias, flags, lower, upper, config_addr, default, memory, is_valid, update) \
+#define createIntConfig(name, alias, flags, lower, upper, config_addr, default, num_conf_flags, is_valid, update) \
+    embedCommonNumericalConfig(name, alias, flags, lower, upper, config_addr, default, num_conf_flags, is_valid, update) \
         .numeric_type = NUMERIC_TYPE_INT, \
         .config.i = &(config_addr) \
     } \
 }
 
-#define createUIntConfig(name, alias, flags, lower, upper, config_addr, default, memory, is_valid, update) \
-    embedCommonNumericalConfig(name, alias, flags, lower, upper, config_addr, default, memory, is_valid, update) \
+#define createUIntConfig(name, alias, flags, lower, upper, config_addr, default, num_conf_flags, is_valid, update) \
+    embedCommonNumericalConfig(name, alias, flags, lower, upper, config_addr, default, num_conf_flags, is_valid, update) \
         .numeric_type = NUMERIC_TYPE_UINT, \
         .config.ui = &(config_addr) \
     } \
 }
 
-#define createLongConfig(name, alias, flags, lower, upper, config_addr, default, memory, is_valid, update) \
-    embedCommonNumericalConfig(name, alias, flags, lower, upper, config_addr, default, memory, is_valid, update) \
+#define createLongConfig(name, alias, flags, lower, upper, config_addr, default, num_conf_flags, is_valid, update) \
+    embedCommonNumericalConfig(name, alias, flags, lower, upper, config_addr, default, num_conf_flags, is_valid, update) \
         .numeric_type = NUMERIC_TYPE_LONG, \
         .config.l = &(config_addr) \
     } \
 }
 
-#define createULongConfig(name, alias, flags, lower, upper, config_addr, default, memory, is_valid, update) \
-    embedCommonNumericalConfig(name, alias, flags, lower, upper, config_addr, default, memory, is_valid, update) \
+#define createULongConfig(name, alias, flags, lower, upper, config_addr, default, num_conf_flags, is_valid, update) \
+    embedCommonNumericalConfig(name, alias, flags, lower, upper, config_addr, default, num_conf_flags, is_valid, update) \
         .numeric_type = NUMERIC_TYPE_ULONG, \
         .config.ul = &(config_addr) \
     } \
 }
 
-#define createLongLongConfig(name, alias, flags, lower, upper, config_addr, default, memory, is_valid, update) \
-    embedCommonNumericalConfig(name, alias, flags, lower, upper, config_addr, default, memory, is_valid, update) \
+#define createLongLongConfig(name, alias, flags, lower, upper, config_addr, default, num_conf_flags, is_valid, update) \
+    embedCommonNumericalConfig(name, alias, flags, lower, upper, config_addr, default, num_conf_flags, is_valid, update) \
         .numeric_type = NUMERIC_TYPE_LONG_LONG, \
         .config.ll = &(config_addr) \
     } \
 }
 
-#define createULongLongConfig(name, alias, flags, lower, upper, config_addr, default, memory, is_valid, update) \
-    embedCommonNumericalConfig(name, alias, flags, lower, upper, config_addr, default, memory, is_valid, update) \
+#define createULongLongConfig(name, alias, flags, lower, upper, config_addr, default, num_conf_flags, is_valid, update) \
+    embedCommonNumericalConfig(name, alias, flags, lower, upper, config_addr, default, num_conf_flags, is_valid, update) \
         .numeric_type = NUMERIC_TYPE_ULONG_LONG, \
         .config.ull = &(config_addr) \
     } \
 }
 
-#define createSizeTConfig(name, alias, flags, lower, upper, config_addr, default, memory, is_valid, update) \
-    embedCommonNumericalConfig(name, alias, flags, lower, upper, config_addr, default, memory, is_valid, update) \
+#define createSizeTConfig(name, alias, flags, lower, upper, config_addr, default, num_conf_flags, is_valid, update) \
+    embedCommonNumericalConfig(name, alias, flags, lower, upper, config_addr, default, num_conf_flags, is_valid, update) \
         .numeric_type = NUMERIC_TYPE_SIZE_T, \
         .config.st = &(config_addr) \
     } \
 }
 
-#define createSSizeTConfig(name, alias, flags, lower, upper, config_addr, default, memory, is_valid, update) \
-    embedCommonNumericalConfig(name, alias, flags, lower, upper, config_addr, default, memory, is_valid, update) \
+#define createSSizeTConfig(name, alias, flags, lower, upper, config_addr, default, num_conf_flags, is_valid, update) \
+    embedCommonNumericalConfig(name, alias, flags, lower, upper, config_addr, default, num_conf_flags, is_valid, update) \
         .numeric_type = NUMERIC_TYPE_SSIZE_T, \
         .config.sst = &(config_addr) \
     } \
 }
 
-#define createTimeTConfig(name, alias, flags, lower, upper, config_addr, default, memory, is_valid, update) \
-    embedCommonNumericalConfig(name, alias, flags, lower, upper, config_addr, default, memory, is_valid, update) \
+#define createTimeTConfig(name, alias, flags, lower, upper, config_addr, default, num_conf_flags, is_valid, update) \
+    embedCommonNumericalConfig(name, alias, flags, lower, upper, config_addr, default, num_conf_flags, is_valid, update) \
         .numeric_type = NUMERIC_TYPE_TIME_T, \
         .config.tt = &(config_addr) \
     } \
 }
 
-#define createOffTConfig(name, alias, flags, lower, upper, config_addr, default, memory, is_valid, update) \
-    embedCommonNumericalConfig(name, alias, flags, lower, upper, config_addr, default, memory, is_valid, update) \
+#define createOffTConfig(name, alias, flags, lower, upper, config_addr, default, num_conf_flags, is_valid, update) \
+    embedCommonNumericalConfig(name, alias, flags, lower, upper, config_addr, default, num_conf_flags, is_valid, update) \
         .numeric_type = NUMERIC_TYPE_OFF_T, \
         .config.ot = &(config_addr) \
     } \
@@ -2554,6 +2595,7 @@ standardConfig configs[] = {
     createStringConfig("replica-announce-ip", "slave-announce-ip", MODIFIABLE_CONFIG, EMPTY_STRING_IS_NULL, server.slave_announce_ip, NULL, NULL, NULL),
     createStringConfig("masteruser", NULL, MODIFIABLE_CONFIG | SENSITIVE_CONFIG, EMPTY_STRING_IS_NULL, server.masteruser, NULL, NULL, NULL),
     createStringConfig("cluster-announce-ip", NULL, MODIFIABLE_CONFIG, EMPTY_STRING_IS_NULL, server.cluster_announce_ip, NULL, NULL, NULL),
+    createStringConfig("cluster-config-file", NULL, IMMUTABLE_CONFIG, ALLOW_EMPTY_STRING, server.cluster_configfile, "nodes.conf", NULL, NULL),
     createStringConfig("syslog-ident", NULL, IMMUTABLE_CONFIG, ALLOW_EMPTY_STRING, server.syslog_ident, "redis", NULL, NULL),
     createStringConfig("dbfilename", NULL, MODIFIABLE_CONFIG, ALLOW_EMPTY_STRING, server.rdb_filename, "dump.rdb", isValidDBfilename, NULL),
     createStringConfig("appendfilename", NULL, IMMUTABLE_CONFIG, ALLOW_EMPTY_STRING, server.aof_filename, "appendonly.aof", isValidAOFfilename, NULL),
@@ -2564,6 +2606,7 @@ standardConfig configs[] = {
     createStringConfig("ignore-warnings", NULL, MODIFIABLE_CONFIG, ALLOW_EMPTY_STRING, server.ignore_warnings, "", NULL, NULL),
     createStringConfig("proc-title-template", NULL, MODIFIABLE_CONFIG, ALLOW_EMPTY_STRING, server.proc_title_template, CONFIG_DEFAULT_PROC_TITLE_TEMPLATE, isValidProcTitleTemplate, updateProcTitleTemplate),
     createStringConfig("bind-source-addr", NULL, MODIFIABLE_CONFIG, EMPTY_STRING_IS_NULL, server.bind_source_addr, NULL, NULL, NULL),
+    createStringConfig("logfile", NULL, IMMUTABLE_CONFIG, ALLOW_EMPTY_STRING, server.logfile, "", NULL, NULL),
 
     /* SDS Configs */
     createSDSConfig("masterauth", NULL, MODIFIABLE_CONFIG | SENSITIVE_CONFIG, EMPTY_STRING_IS_NULL, server.masterauth, NULL, NULL, NULL),
@@ -2638,14 +2681,15 @@ standardConfig configs[] = {
     /* Size_t configs */
     createSizeTConfig("hash-max-listpack-entries", "hash-max-ziplist-entries", MODIFIABLE_CONFIG, 0, LONG_MAX, server.hash_max_listpack_entries, 512, INTEGER_CONFIG, NULL, NULL),
     createSizeTConfig("set-max-intset-entries", NULL, MODIFIABLE_CONFIG, 0, LONG_MAX, server.set_max_intset_entries, 512, INTEGER_CONFIG, NULL, NULL),
-    createSizeTConfig("zset-max-ziplist-entries", NULL, MODIFIABLE_CONFIG, 0, LONG_MAX, server.zset_max_ziplist_entries, 128, INTEGER_CONFIG, NULL, NULL),
+    createSizeTConfig("zset-max-listpack-entries", "zset-max-ziplist-entries", MODIFIABLE_CONFIG, 0, LONG_MAX, server.zset_max_listpack_entries, 128, INTEGER_CONFIG, NULL, NULL),
     createSizeTConfig("active-defrag-ignore-bytes", NULL, MODIFIABLE_CONFIG, 1, LLONG_MAX, server.active_defrag_ignore_bytes, 100<<20, MEMORY_CONFIG, NULL, NULL), /* Default: don't defrag if frag overhead is below 100mb */
     createSizeTConfig("hash-max-listpack-value", "hash-max-ziplist-value", MODIFIABLE_CONFIG, 0, LONG_MAX, server.hash_max_listpack_value, 64, MEMORY_CONFIG, NULL, NULL),
     createSizeTConfig("stream-node-max-bytes", NULL, MODIFIABLE_CONFIG, 0, LONG_MAX, server.stream_node_max_bytes, 4096, MEMORY_CONFIG, NULL, NULL),
-    createSizeTConfig("zset-max-ziplist-value", NULL, MODIFIABLE_CONFIG, 0, LONG_MAX, server.zset_max_ziplist_value, 64, MEMORY_CONFIG, NULL, NULL),
+    createSizeTConfig("zset-max-listpack-value", "zset-max-ziplist-value", MODIFIABLE_CONFIG, 0, LONG_MAX, server.zset_max_listpack_value, 64, MEMORY_CONFIG, NULL, NULL),
     createSizeTConfig("hll-sparse-max-bytes", NULL, MODIFIABLE_CONFIG, 0, LONG_MAX, server.hll_sparse_max_bytes, 3000, MEMORY_CONFIG, NULL, NULL),
     createSizeTConfig("tracking-table-max-keys", NULL, MODIFIABLE_CONFIG, 0, LONG_MAX, server.tracking_table_max_keys, 1000000, INTEGER_CONFIG, NULL, NULL), /* Default: 1 million keys max. */
     createSizeTConfig("client-query-buffer-limit", NULL, DEBUG_CONFIG | MODIFIABLE_CONFIG, 1024*1024, LONG_MAX, server.client_max_querybuf_len, 1024*1024*1024, MEMORY_CONFIG, NULL, NULL), /* Default: 1GB max query buffer. */
+    createSSizeTConfig("maxmemory-clients", NULL, MODIFIABLE_CONFIG, -100, SSIZE_MAX, server.maxmemory_clients, 0, MEMORY_CONFIG | PERCENT_CONFIG, NULL, NULL),
 
     /* Other configs */
     createTimeTConfig("repl-backlog-ttl", NULL, MODIFIABLE_CONFIG, 0, LONG_MAX, server.repl_backlog_time_limit, 60*60, INTEGER_CONFIG, NULL, NULL), /* Default: 1 hour */
